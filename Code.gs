@@ -76,6 +76,7 @@ function onOpen() {
   SpreadsheetApp.getUi().createMenu('Roster')
     .addItem('Generate schedule', 'generateSchedule')
     .addItem('Enhanced Graveyard', 'generateEnhancedGraveyard')
+    .addItem('Set Exact-mode points baseline', 'initializeExactPointsBaseline')
     .addItem('Fix roster colours', 'fixRosterColors')
     .addItem('Refresh Points Log', 'refreshPointsLog')
     .addToUi();
@@ -573,6 +574,7 @@ function updateEnhancedGraveyardInPlace_() {
     log = log.concat(v.lines);
     if (v.warnings.length) log.push('WARNINGS:\n- ' + v.warnings.join('\n- '));
     updateCurrentRosterGraveyard_(roster, m, res.X, current.rowByKey);
+    updateRosterBaselineGraveyard_(ss, roster, rosterName);
     SpreadsheetApp.flush();
     try {
       updateCurrentRosterImportTab_(ss, rosterName);
@@ -748,7 +750,7 @@ function archiveOutputSheets(ss, rosterName, pointsName) {
     if (/^Points Log$/i.test(name)) return;
     if (!/^(Roster|Points)( |$)/i.test(name)) return;
     sh.hideSheet();
-    if (name === rosterName || name === pointsName) {
+    if (name === rosterName || name === pointsName || name === baselineRosterSheetName(rosterName)) {
       var base = 'Archived ' + name + ' (' + now + ')', archiveName = base, n = 2;
       while (ss.getSheetByName(archiveName)) archiveName = base + ' ' + n++;
       sh.setName(archiveName);
@@ -757,6 +759,143 @@ function archiveOutputSheets(ss, rosterName, pointsName) {
 }
 
 function quotedSheet(name) { return "'" + String(name).replace(/'/g, "''") + "'"; }
+
+function baselineRosterSheetName(rosterName) {
+  return String(rosterName).replace(/^Roster/i, 'Roster Baseline');
+}
+
+// Snapshot the generated assignment cells so later manual additions can be
+// separated from the schedule's original points in Exact mode.
+function writeRosterBaseline_(ss, roster, rosterName) {
+  var rows = roster.getLastRow();
+  var baselineName = baselineRosterSheetName(rosterName);
+  var old = ss.getSheetByName(baselineName);
+  if (old) ss.deleteSheet(old);
+  var baseline = ss.insertSheet(baselineName);
+  var source = roster.getRange(1, 1, rows, 25).getValues(); // A:Y covers AM, PM, and Graveyard.
+  var snapshot = grid(rows, 25, '');
+  for (var r = FIRST_ROW - 1; r < rows; r++) {
+    snapshot[r][0] = source[r][0];
+    snapshot[r][1] = source[r][1];
+    for (var c = 2; c < 25; c++) {
+      var value = String(source[r][c] || '').trim().toUpperCase();
+      if (value === 'X' || value === 'AM') snapshot[r][c] = value;
+    }
+  }
+  baseline.getRange(1, 1, rows, 25).setValues(snapshot);
+  baseline.hideSheet();
+  return baseline;
+}
+
+function exactModePointsFormula_(rosterName, baselineName, rosterRow, pointsRow, pointsDataRow) {
+  var rosterRef = quotedSheet(rosterName) + '!';
+  var baselineRef = quotedSheet(baselineName) + '!';
+  var current = rosterRef + '$C' + rosterRow + ':$Y' + rosterRow;
+  var base = baselineRef + '$C' + rosterRow + ':$Y' + rosterRow;
+  var weightX = rosterRef + '$C$' + pointsRow + ':$Y$' + pointsRow;
+  var weightAM = rosterRef + '$C$' + (pointsRow + 1) + ':$Y$' + (pointsRow + 1);
+  var retained = 'SUMPRODUCT((' + current + '="X")*(' + base + '<>"")*' + weightX + ')'
+    + '+SUMPRODUCT((' + current + '="AM")*(' + base + '<>"")*' + weightAM + ')';
+  var extras = [];
+  [[3, 9], [11, 17], [19, 25]].forEach(function (cols) {
+    var cur = rosterRef + '$' + colLetter(cols[0]) + rosterRow + ':$' + colLetter(cols[1]) + rosterRow;
+    var original = baselineRef + '$' + colLetter(cols[0]) + rosterRow + ':$' + colLetter(cols[1]) + rosterRow;
+    var wx = rosterRef + '$' + colLetter(cols[0]) + '$' + pointsRow + ':$' + colLetter(cols[1]) + '$' + pointsRow;
+    var wa = rosterRef + '$' + colLetter(cols[0]) + '$' + (pointsRow + 1) + ':$' + colLetter(cols[1]) + '$' + (pointsRow + 1);
+    var added = 'SUMPRODUCT((' + original + '="")*((' + cur + '="X")+(' + cur + '="AM")))';
+    var days = '(COUNTIF(' + cur + ',"X")+COUNTIF(' + cur + ',"AM"))';
+    var extraValue = 'SUMPRODUCT((' + original + '="")*(' + cur + '="X")*' + wx + ')'
+      + '+SUMPRODUCT((' + original + '="")*(' + cur + '="AM")*' + wa + ')';
+    extras.push('(' + extraValue + ')*MIN(' + added + ',MAX(0,' + days + '-5))/MAX(1,' + added + ')');
+  });
+  var admin = rosterRef + '$AA' + rosterRow + ':$AE' + rosterRow;
+  var adminX = rosterRef + '$AA$' + pointsRow + ':$AE$' + pointsRow;
+  var adminAM = rosterRef + '$AA$' + (pointsRow + 1) + ':$AE$' + (pointsRow + 1);
+  var adminPoints = 'SUMPRODUCT((' + admin + '="X")*' + adminX + ')+SUMPRODUCT((' + admin + '="AM")*' + adminAM + ')';
+  return '=' + retained + '+' + extras.join('+') + '+' + adminPoints + '+$B$3*G' + pointsDataRow + '+L' + pointsDataRow;
+}
+
+function exactModeDayBonusFormula_(rosterName, baselineName, rosterRow, pointsDataRow) {
+  var rosterRef = quotedSheet(rosterName) + '!';
+  var baselineRef = quotedSheet(baselineName) + '!';
+  var retained = [], extras = [];
+  [[3, 9], [11, 17], [19, 25]].forEach(function (cols) {
+    var cur = rosterRef + '$' + colLetter(cols[0]) + rosterRow + ':$' + colLetter(cols[1]) + rosterRow;
+    var original = baselineRef + '$' + colLetter(cols[0]) + rosterRow + ':$' + colLetter(cols[1]) + rosterRow;
+    retained.push('SUMPRODUCT((' + original + '<>"")*((' + cur + '="X")+(' + cur + '="AM")))');
+    var added = 'SUMPRODUCT((' + original + '="")*((' + cur + '="X")+(' + cur + '="AM")))';
+    var days = '(COUNTIF(' + cur + ',"X")+COUNTIF(' + cur + ',"AM"))';
+    extras.push('MIN(' + added + ',MAX(0,' + days + '-5))');
+  });
+  return '=IF(K' + pointsDataRow + '="Yes",$B$2*(' + retained.join('+') + '+' + extras.join('+') + '+P' + pointsDataRow + '),0)';
+}
+
+function initializeExactPointsBaseline() {
+  var ss = SpreadsheetApp.getActive();
+  var roster = currentRosterSheet_(ss);
+  var rosterName = roster.getName();
+  var points = ss.getSheetByName(rosterName.replace(/^Roster/i, 'Points'));
+  if (!points) throw new PlanError('The active Roster has no matching Points sheet.');
+  var baselineName = baselineRosterSheetName(rosterName);
+  if (ss.getSheetByName(baselineName)) throw new PlanError('A points baseline already exists for this Roster.');
+  var settings = sheetValues(ss, 'Settings');
+  var mode = 'QUOTA';
+  for (var i = 0; i < settings.length; i++) {
+    if (String(settings[i][0] || '').trim() === 'Mode (QUOTA or EXACT)') {
+      mode = String(settings[i][1] || 'QUOTA').trim().toUpperCase();
+      break;
+    }
+  }
+  if (mode !== 'EXACT') throw new PlanError("Set Mode to EXACT in Settings before creating the baseline for the active Roster.");
+
+  var section = findRosterSectionRows(roster), lastRow = roster.getLastRow();
+  var rosterValues = roster.getRange(1, 1, lastRow, 2).getValues(), rowByName = {};
+  for (var r = FIRST_ROW - 1; r < (section ? section.personLastRow : lastRow); r++) {
+    var name = String(rosterValues[r][0] || '').trim();
+    if (name && rosterValues[r][1]) rowByName[norm(name)] = r + 1;
+  }
+  var pointValues = points.getDataRange().getValues(), pointsRow = null, dataStart = 6;
+  var rosterLabels = roster.getRange(1, 1, lastRow, 1).getValues();
+  for (var j = 0; j < rosterLabels.length; j++) {
+    if (String(rosterLabels[j][0] || '').trim() === 'Points per shift (X)') { pointsRow = j + 1; break; }
+  }
+  if (!pointsRow) throw new PlanError('Could not locate the shift point weights on the active Roster.');
+  writeRosterBaseline_(ss, roster, rosterName);
+  var updated = 0;
+  for (var p = dataStart - 1; p < pointValues.length; p++) {
+    var memberName = String(pointValues[p][1] || '').trim();
+    if (!memberName) continue;
+    var rosterRow = rowByName[norm(memberName)];
+    if (!rosterRow) continue;
+    points.getRange(p + 1, 3).setFormula(exactModePointsFormula_(rosterName, baselineName, rosterRow, pointsRow, p + 1));
+    points.getRange(p + 1, 12).setFormula(exactModeDayBonusFormula_(rosterName, baselineName, rosterRow, p + 1));
+    updated++;
+  }
+  points.getRange('Q2').setValue('Mode: EXACT');
+  var noteCell = points.getRange(pointValues.length, 1);
+  noteCell.setValue('Exact mode: generated shifts retain their points. Manually added AM/PM/Graveyard shifts count only for workdays above five in that week; additions up to five do not inflate points. Admin entries keep their normal points.');
+  SpreadsheetApp.flush();
+  var message = 'Baseline saved for ' + updated + ' member(s). Future manual AM/PM/Graveyard additions count only when they take a member above five workdays in a week.';
+  buildPointsLog(ss);
+  SpreadsheetApp.getUi().alert('Exact-mode points baseline set', message, SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+function updateRosterBaselineGraveyard_(ss, roster, rosterName) {
+  var baseline = ss.getSheetByName(baselineRosterSheetName(rosterName));
+  if (!baseline) return;
+  var rows = roster.getLastRow();
+  var source = roster.getRange(1, 1, rows, 25).getValues();
+  var values = [];
+  for (var r = FIRST_ROW - 1; r < rows; r++) {
+    var row = [];
+    for (var c = START_COL[2] - 1; c < START_COL[2] + 6; c++) {
+      var value = String(source[r][c] || '').trim().toUpperCase();
+      row.push(value === 'X' || value === 'AM' ? value : '');
+    }
+    values.push(row);
+  }
+  if (values.length) baseline.getRange(FIRST_ROW, START_COL[2], values.length, 7).setValues(values);
+}
 
 // ------------------------------------------------------------------ dates (day numbers since 1970-01-01)
 function dnFromYMD(y, mo, d) { return Math.round(Date.UTC(y, mo - 1, d) / 86400000); }
@@ -1668,6 +1807,7 @@ function writeRoster(ss, m, X, rosterName, pointsName) {
   addAssignmentColorRules(sh, lastPerson);
   sh.getRange(check0, 1, totalRows - check0 + 1, lastCol)
     .setBackground(C_WHITE).setFontColor('#000000').setFontWeight('bold').setFontStyle('normal');
+  writeRosterBaseline_(ss, sh, rosterName);
   writePoints(ss, m, X, personRow, ptsR, rosterName, pointsName);
 }
 
@@ -1681,8 +1821,10 @@ function writePoints(ss, m, X, personRow, ptsR, rosterName, pointsName) {
     V[r - 1][c - 1] = v;
     if (o) { if (o.bg) BG[r - 1][c - 1] = o.bg; if (o.bold) FW[r - 1][c - 1] = 'bold'; if (o.color) FC[r - 1][c - 1] = o.color; }
   }
+  var baselineName = baselineRosterSheetName(rosterName);
   put(1, 1, 'Points parameters (blue cells can be edited and the table updates)', { bold: true });
   put(1, 17, 'Graveyard planning: ' + (cfg.planGraveyard ? 'COMPLETE' : 'PENDING'));
+  put(2, 17, 'Mode: ' + cfg.mode);
   put(2, 1, 'Day bonus per day worked'); put(2, 2, cfg.pDay, { color: '#0000ff' });
   put(3, 1, 'Back-to-back night penalty'); put(3, 2, cfg.pB2b, { color: '#0000ff' });
   put(2, 4, 'Average points per AM shift'); put(2, 5, m.avg[0]);
@@ -1701,7 +1843,11 @@ function writePoints(ss, m, X, personRow, ptsR, rosterName, pointsName) {
     put(r, 11, people[p].nobonus ? 'No' : 'Yes', { color: '#0000ff' });
     for (var k = 0; k < 3; k++) put(r, 13 + k, tab[p].req[k]);
     put(r, 16, '=COUNTIF(' + rosterRef + '$AA' + rr + ':$AE' + rr + ',"X")');
-    put(r, 3, '=SUMPRODUCT((' + rowAll + '="X")*' + wX + ')+SUMPRODUCT((' + rowAll + '="AM")*' + wAm + ')+$B$3*G' + r + '+L' + r);
+    if (cfg.mode === 'EXACT') {
+      put(r, 3, exactModePointsFormula_(rosterName, baselineName, rr, ptsR, r));
+    } else {
+      put(r, 3, '=SUMPRODUCT((' + rowAll + '="X")*' + wX + ')+SUMPRODUCT((' + rowAll + '="AM")*' + wAm + ')+$B$3*G' + r + '+L' + r);
+    }
     put(r, 4, '=COUNTIF(' + rowAll + ',"X")+COUNTIF(' + rowAll + ',"AM")');
     put(r, 5, '=7*(COUNTIF(' + rosterRef + '$C' + rr + ':$I' + rr + ',"X")+COUNTIF(' + rosterRef + '$K' + rr + ':$Q' + rr + ',"X")+COUNTIF(' + rowAll + ',"AM"))+10*F' + r + '+P' + r + '*' + cfg.adminHrs);
     put(r, 6, '=COUNTIF(' + rosterRef + '$S' + rr + ':$Y' + rr + ',"X")');
@@ -1710,10 +1856,16 @@ function writePoints(ss, m, X, personRow, ptsR, rosterName, pointsName) {
     var base = people[p].perm ? '(M' + r + '+N' + r + '+O' + r + ')*$E$2' : 'M' + r + '*$E$2+N' + r + '*$E$3+O' + r + '*$H$2';
     put(r, 9, '=' + base + '+P' + r + '*$H$3+IF(K' + r + '="Yes",$B$2,0)*(M' + r + '+N' + r + '+O' + r + '+P' + r + ')');
     put(r, 10, '=IF(I' + r + '=0,0,C' + r + '/I' + r + ')');
-    put(r, 12, '=IF(K' + r + '="Yes",$B$2*D' + r + ',0)');
+    if (cfg.mode === 'EXACT') {
+      put(r, 12, exactModeDayBonusFormula_(rosterName, baselineName, rr, r));
+    } else {
+      put(r, 12, '=IF(K' + r + '="Yes",$B$2*D' + r + ',0)');
+    }
     put(r, 1, '=RANK(J' + r + ',$J$' + r0 + ':$J$' + (r0 + n - 1) + ',0)');
   }
-  put(r0 + n + 1, 1, 'Total points = shift values (hour weights, weekend add-on, recovery) + back-to-back penalty + day bonus. Admin days entered by hand add points and also raise the fair-share target, so they do not skew the % column.');
+  put(r0 + n + 1, 1, cfg.mode === 'EXACT'
+    ? 'Exact mode: generated shifts retain their points. Manually added AM/PM/Graveyard shifts count only for workdays above five in that week; additions up to five do not inflate points. Admin entries keep their normal points.'
+    : 'Total points = shift values (hour weights, weekend add-on, recovery) + back-to-back penalty + day bonus. Admin days entered by hand add points and also raise the fair-share target, so they do not skew the % column.');
   var sh = newOutputSheet(ss, pointsName, 1);
   var rng = sh.getRange(1, 1, totalRows, lastCol);
   rng.setValues(V); rng.setBackgrounds(BG); rng.setFontWeights(FW); rng.setFontColors(FC);
